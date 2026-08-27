@@ -1,0 +1,284 @@
+name: Virada de PRs testados com sucesso
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  virada:
+    if: |
+      contains(github.event.comment.body, 'testado com sucesso') &&
+      !contains(
+        join(github.event.issue.labels.*.name, ','),
+        'incluido-na-virada'
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validar comentário (PR + QA autorizado)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.NODE_AUTH_TOKEN }}
+          script: |
+            const allowedUsers = ["gbrlsntnvs", "andregodeiro", "ericannasc", "Nahrbraga", "PedroPaulo-Dev"]; // logins do GitHub
+            const commentAuthor = context.payload.comment.user.login;
+            const commentBody = context.payload.comment.body.trim().toLowerCase();
+
+            // Garantir que é comentário em PR
+            if (!context.payload.issue.pull_request) {
+              core.setFailed("Comentário não está associado a um PR.");
+            }
+
+            //  Validar usuário do GitHub
+            if (!allowedUsers.includes(commentAuthor)) {
+              core.setFailed(
+                `Usuário '${commentAuthor}' não autorizado. Apenas QA pode validar PR.`
+              );
+            }
+
+            //  Validar texto do comentário
+            if (commentBody !== "testado com sucesso") {
+              core.setFailed("Comentário inválido para virada.");
+            }
+
+      - name: Buscar dados do PR
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.NODE_AUTH_TOKEN }}
+          script: |
+            const prNumber = context.payload.issue.number;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            if (pr.base.ref !== "develop") {
+              core.setFailed("PR não é contra develop.");
+            }
+
+            if (!pr.merged_at) {
+              core.setFailed("PR ainda não foi mergeado em develop.");
+            }
+
+            core.setOutput("number", pr.number);
+            core.setOutput("title", pr.title);
+            core.setOutput("merge_commit_sha", pr.merge_commit_sha);
+            core.setOutput("head_ref", pr.head.ref);
+            core.setOutput("labels", pr.labels.map(l => l.name).join(","));
+
+      - name: Determinar branch de seleção ativa
+        id: release
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.NODE_AUTH_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const { data: branches } = await github.rest.repos.listBranches({
+              owner,
+              repo,
+              per_page: 100
+            });
+
+            const selectionBranches = branches
+              .map(b => b.name)
+              .filter(name => /^selecionados-v\d+$/.test(name));
+
+            const versions = selectionBranches.map(name =>
+              Number(name.replace("selecionados-v", ""))
+            );
+
+            const lastVersion = versions.length ? Math.max(...versions) : 0;
+
+            async function isMerged(branch) {
+              try {
+                const { data } = await github.rest.repos.compareCommits({
+                  owner,
+                  repo,
+                  base: "master",
+                  head: branch
+                });
+                return data.ahead_by === 0;
+              } catch {
+                return false;
+              }
+            }
+
+            let branch;
+
+            if (lastVersion > 0) {
+              const lastBranch = `selecionados-v${lastVersion}`;
+              const merged = await isMerged(lastBranch);
+              if (!merged) {
+                branch = lastBranch;
+              }
+            }
+
+            if (!branch) {
+              branch = `selecionados-v${lastVersion + 1}`;
+
+              try {
+                await github.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: `heads/${branch}`
+                });
+              } catch {
+                const { data: masterRef } = await github.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: "heads/master"
+                });
+                await github.rest.git.createRef({
+                  owner,
+                  repo,
+                  ref: `refs/heads/${branch}`,
+                  sha: masterRef.object.sha
+                });
+              }
+            }
+
+            core.setOutput("branch", branch);
+
+      - name: Incluir commit do PR na branch de seleção
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.NODE_AUTH_TOKEN }}
+          script: |
+            await github.rest.repos.merge({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              base: "${{ steps.release.outputs.branch }}",
+              head: "${{ steps.pr.outputs.head_ref }}",
+              commit_message: "Virada automática do PR #${{ steps.pr.outputs.number }}"
+            });
+
+      - name: Criar ou atualizar PR acumulativo
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.NODE_AUTH_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoName = context.repo.repo;
+            const branch = "${{ steps.release.outputs.branch }}";
+
+            const hoje = new Date();
+            const dataFormatada = hoje.toISOString().split("T")[0];
+            const tituloPR = `[${repoName}] Selecionados para publicação em produção ${dataFormatada}`;
+
+            const { data: compare } = await github.rest.repos.compareCommits({
+              owner,
+              repo,
+              base: "master",
+              head: branch
+            });
+
+            const includedPRsMap = new Map();
+
+            for (const commit of compare.commits) {
+              const { data: prs } =
+                await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner,
+                  repo,
+                  commit_sha: commit.sha
+                });
+
+              for (const pr of prs) {
+                if (pr.merged_at) {
+                  includedPRsMap.set(pr.number, `- #${pr.number} – ${pr.title}`);
+                }
+              }
+            }
+
+            const includedPRs = Array.from(includedPRsMap.values()).sort((a, b) => {
+              const numA = Number(a.match(/#(\d+)/)[1]);
+              const numB = Number(b.match(/#(\d+)/)[1]);
+              return numA - numB;
+            });
+
+            const { data: prsOpen } = await github.rest.pulls.list({
+              owner,
+              repo,
+              base: "master",
+              head: `${owner}:${branch}`,
+              state: "open"
+            });
+
+            let releasePr;
+
+            if (prsOpen.length === 0) {
+              const body = [
+                "## 📦 PR de Virada – PRs testados com sucesso",
+                "",
+                "PR gerado automaticamente pela esteira de virada, contendo apenas PRs mergeados diretamente na branch de seleção.",
+                "",
+                "---",
+                "",
+                "## 📝 PRs incluídos nesta virada",
+                "<!-- PRS_INCLUDED_START -->",
+                ...includedPRs,
+                "<!-- PRS_INCLUDED_END -->",
+                "",
+                "---",
+                "",
+                "## 🧪 Checklist",
+                "- [ ] PRs testados em alpha e beta antes de serem selecionados",
+                "- [ ] Automatizados **NÃO** detectaram erros",
+                "- [ ] Sem conflitos",
+                "- [ ] Conteúdo correto para produção"
+              ].join("\n");
+
+              const { data } = await github.rest.pulls.create({
+                owner,
+                repo,
+                base: "master",
+                head: branch,
+                title: tituloPR,
+                body
+              });
+
+              releasePr = data;
+            } else {
+              releasePr = prsOpen[0];
+
+              const updatedBody = releasePr.body.replace(
+                /<!-- PRS_INCLUDED_START -->[\s\S]*<!-- PRS_INCLUDED_END -->/,
+                `<!-- PRS_INCLUDED_START -->\n${includedPRs.join("\n")}\n<!-- PRS_INCLUDED_END -->`
+              );
+
+              await github.rest.pulls.update({
+                owner,
+                repo,
+                pull_number: releasePr.number,
+                body: updatedBody
+              });
+            }
+
+
+      - name: Marcar PR como incluído
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.NODE_AUTH_TOKEN }}
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number("${{ steps.pr.outputs.number }}"),
+              labels: ["incluido-na-virada"]
+            });
+
+      - name: Comentar sucesso no PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.NODE_AUTH_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number("${{ steps.pr.outputs.number }}"),
+              body: "✅ PR incluído com sucesso na branch de seleção."
+            });
